@@ -1,5 +1,5 @@
 ## Send-message-decoupling
-### Decouple Amazon Pinpointmulti channel message sending process via APIGate way and SQS
+### Decouple Amazon Pinpoint multi channel message sending process via APIGate way and SQS
 
 ![Screenshot](images/Send-message-decoupling.png)
 
