@@ -1,0 +1,255 @@
+Description: Decouple Pinpoint message execution via APIgateway and SQS
+Outputs:
+  ApiEndpoint:
+    Description: Endpoint for this stage of the api
+    Value: !Join
+      - ''
+      - - https://
+        - !Ref 'APIGateway'
+        - .execute-api.
+        - !Ref 'AWS::Region'
+        - .amazonaws.com/
+        - prod
+  QueueArnSQS:
+    Description: ARN of SQS Queue
+    Value: !GetAtt 'DestQueue.Arn'
+Parameters:
+  queueName:
+    Description: The name of the SQS queue to create.
+    Type: String
+Resources:
+  APIGateway:
+    Properties:
+      Description: API Endpoint to receive JSON payloads and queue in SQS
+      Name: APIGateway
+    Type: AWS::ApiGateway::RestApi
+  APIGatewayRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+        Version: '2012-10-17'
+      Path: /
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action: sqs:SendMessage
+                Effect: Allow
+                Resource: !GetAtt 'DestQueue.Arn'
+              - Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Effect: Allow
+                Resource: '*'
+            Version: '2012-10-17'
+          PolicyName: apig-sqs-send-msg-policy
+      RoleName: apig-sqs-send-msg-role
+    Type: AWS::IAM::Role
+  DestQueue:
+    Properties:
+      DelaySeconds: 0
+      MaximumMessageSize: 262144
+      MessageRetentionPeriod: 1209600
+      QueueName: !Ref 'queueName'
+      ReceiveMessageWaitTimeSeconds: 0
+      VisibilityTimeout: 30
+    Type: AWS::SQS::Queue
+  PolicySQS:
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action: SQS:*
+            Effect: Allow
+            Principal: '*'
+            Resource: !GetAtt 'DestQueue.Arn'
+            Sid: Sid1517269801413
+        Version: '2012-10-17'
+      Queues:
+        - !Ref 'DestQueue'
+    Type: AWS::SQS::QueuePolicy
+  PostMethod:
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: POST
+      Integration:
+        Credentials: !GetAtt 'APIGatewayRole.Arn'
+        IntegrationHttpMethod: POST
+        IntegrationResponses:
+          - StatusCode: '200'
+        PassthroughBehavior: NEVER
+        RequestParameters:
+          integration.request.header.Content-Type: '''application/x-www-form-urlencoded'''
+        RequestTemplates:
+          application/json: Action=SendMessage&MessageBody=$input.body
+        Type: AWS
+        Uri: !Join
+          - ''
+          - - 'arn:aws:apigateway:'
+            - !Ref 'AWS::Region'
+            - :sqs:path/
+            - !Ref 'AWS::AccountId'
+            - /
+            - !Ref 'queueName'
+      MethodResponses:
+        - ResponseModels:
+            application/json: Empty
+          StatusCode: '200'
+      ResourceId: !Ref 'enqueueResource'
+      RestApiId: !Ref 'APIGateway'
+    Type: AWS::ApiGateway::Method
+  enqueueResource:
+    Properties:
+      ParentId: !Ref 'v1Resource'
+      PathPart: enqueue
+      RestApiId: !Ref 'APIGateway'
+    Type: AWS::ApiGateway::Resource
+  prodDeployment:
+    DependsOn: PostMethod
+    Properties:
+      RestApiId: !Ref 'APIGateway'
+    Type: AWS::ApiGateway::Deployment
+  prodStage:
+    Properties:
+      DeploymentId: !Ref 'prodDeployment'
+      RestApiId: !Ref 'APIGateway'
+      StageName: prod
+    Type: AWS::ApiGateway::Stage
+  v1Resource:
+    Properties:
+      ParentId: !GetAtt 'APIGateway.RootResourceId'
+      PathPart: v1
+      RestApiId: !Ref 'APIGateway'
+    Type: AWS::ApiGateway::Resource
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: "python3.8"
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          LOG_LEVEL: "INFO"
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from botocore.exceptions import ClientError
+
+          region = "us-east-1"
+          client = boto3.client('pinpoint',region_name=region)
+
+          def execute_send_message(payload):
+
+              print("payload : - "  payload)
+              # TO DO : - Folling details like  Origination nummber/desitination number 
+              # Message content/senderID would get extracted  
+              originationNumber = "+12342319214"
+              senderId = "SENDER"
+              destinationNumber = "+91991655323"
+              # The content of the SMS message.
+              message = ("message content")
+              pinpoint_applicationId = "6a136336668a48959dd781f63344bc08"
+              messageType = "PROMOTIONAL"
+              # The registered keyword associated with the originating short code leave it blank if using sender IDs
+              registeredKeyword = "keyword_753631027292"
+              
+              try:
+                  response = client.send_messages(
+                      ApplicationId=pinpoint_applicationId,
+                      MessageRequest={
+                          'Addresses': {
+                              destinationNumber: {
+                                  'ChannelType': 'SMS'
+                              }
+                          },
+                          'MessageConfiguration': {
+                              'SMSMessage': {
+                                  'Body': message,
+                                  'Keyword': registeredKeyword,
+                                  'MessageType': messageType,
+                                  'OriginationNumber': originationNumber,
+                                  'SenderId': senderId
+                              }
+                          }
+                      }
+                  )
+              except ClientError as e:
+                  print(e.response['Error']['Message'])
+              else:
+                  print("Message sent! Message ID: "
+                          + response['MessageResponse']['Result'][destinationNumber]['MessageId'])
+              return 'Success'
+
+          def lambda_handler(event, context):
+              
+              #Read from SQS queue
+              for record in event['Records']:
+                  print("SQS iteration strarts")
+                  payload = record["body"]
+                  ## to do - customers need to curate the SQS payload thats coming from API gateway
+                  # and send it to  "execute_send_message" function to call Pinpoint  API. 
+                  execute_send_message(payload)
+                  print(str(payload))
+
+              return responsed
+
+              # Use this code if you don't use the http event with the LAMBDA-PROXY
+              # integration
+              """
+              return {
+                  "message": "Go Serverless v1.0! Your function executed successfully!",
+                  "event": event
+              }
+              """
+
+  LambdaFunctionEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 10
+      Enabled: true
+      EventSourceArn: !GetAtt DestQueue.Arn
+      FunctionName: !GetAtt LambdaFunction.Arn
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Policies:
+        - PolicyName: allowLambdaLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+              - logs:*
+              Resource: arn:aws:logs:*:*:*
+        - PolicyName: allowSqs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+              - sqs:ReceiveMessage
+              - sqs:DeleteMessage
+              - sqs:GetQueueAttributes
+              - sqs:ChangeMessageVisibility
+              Resource: !GetAtt DestQueue.Arn
+
+
